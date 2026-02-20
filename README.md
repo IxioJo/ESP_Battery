@@ -2,7 +2,7 @@
 Controling BLE JKBMS, GTN1200, Emerson R48 and getting power from HEEP request to regulate 
 
 This is the raw code of my ESP32S3 controling my ESS.
-The proposed Yaml code was only tested on an ESP32S3 and need Home Assistant to trigger battery charge or discharge. 
+The proposed Yaml code was only tested on an ESP32S3 and needs Home Assistant to trigger battery charge or discharge. 
 
 It is based on :
 
