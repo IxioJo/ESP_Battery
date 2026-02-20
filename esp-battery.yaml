@@ -1,0 +1,1874 @@
+esphome:
+  name: esp-batterie
+  friendly_name: ESP Batterie
+  comment: ${device_description}
+
+
+
+ 
+ # includes:
+ # - CustomDigipotOutput.h
+ # Define devices
+  devices:
+  - id: JKBMS_55Ah
+    name: "JK BMS 55Ah"
+
+  - id: JBD_BMS
+    name: "BMS JBD Vélo"    
+
+  - id: Emerson
+    name: "Emerson R48 Battery Chargeur"
+
+  - id: Soyosource
+    name: "Soyosource GTN1200 Inverter"      
+  - id: ina 
+    name: "Battery Shunt"   
+
+  - id: powermeter
+    name: "Power Meter"  
+
+
+
+
+  min_version: 2024.6.0
+  project:
+    name: "syssi.esphome-jk-bms"
+    version: 2.1.0  
+
+
+
+
+  on_boot:
+    
+    priority: -100
+    then:
+      - lambda: |-
+          #include "esp_http_client.h"
+          
+          xTaskCreatePinnedToCore(
+            [](void *pvParameters) {
+              ESP_LOGI("http_task", "Démarrage sur core %d", xPortGetCoreID());
+              
+              // Configuration du client HTTP avec keep-alive
+              esp_http_client_config_t config = {};
+              config.url = "http://192.168.1.xxx/status.xml";
+              config.timeout_ms = 2000;
+              config.keep_alive_enable = true;
+              config.keep_alive_idle = 5;
+              config.keep_alive_interval = 5;
+              config.keep_alive_count = 3;
+              
+              esp_http_client_handle_t client = esp_http_client_init(&config);
+              
+              char buffer[2048];
+              float last_power   = -999.0;
+              float last_panel   = -999.0;
+              float last_routage = -999.0;
+              
+              while(true) {
+                // Récupérer le délai dynamiquement
+                int delay_ms = (int)id(http_polling_interval).state;
+                if (delay_ms < 100) delay_ms = 100;  // Sécurité: minimum 100ms
+                
+                // Vérifier si la collecte est activée
+                if (id(http_task_enabled)) {
+                  uint32_t start = millis();
+                  
+                  esp_err_t err = esp_http_client_open(client, 0);
+                  if (err == ESP_OK) {
+                    int content_length = esp_http_client_fetch_headers(client);
+                    int total_read = 0;
+                    
+                    if (content_length > 0 && content_length < sizeof(buffer)) {
+                      total_read = esp_http_client_read(client, buffer, content_length);
+                      buffer[total_read] = '\0';
+                      
+                      if (total_read > 0) {
+                        std::string data(buffer, total_read);
+                        
+                        // Parser le XML
+                        size_t start_pos = data.find("<inAns>");
+                        if (start_pos != std::string::npos) {
+                          start_pos += 7;
+                          size_t end_pos = data.find("<", start_pos);
+                          std::string inAns_content = data.substr(start_pos, end_pos - start_pos);
+                          
+                          // Extraire les valeurs
+                          size_t first_semi = inAns_content.find(";");
+                          if (first_semi != std::string::npos) {
+                            std::string val1_str = inAns_content.substr(0, first_semi);
+                            std::replace(val1_str.begin(), val1_str.end(), ',', '.');
+                            
+                            size_t second_semi = inAns_content.find(";", first_semi + 1);
+                            if (second_semi != std::string::npos) {
+                              std::string val2_str = inAns_content.substr(first_semi + 1, second_semi - first_semi - 1);
+                              std::replace(val2_str.begin(), val2_str.end(), ',', '.');
+
+                              size_t third_semi = inAns_content.find(";", second_semi + 1);
+                              if (third_semi != std::string::npos) {
+                                std::string val3_str = inAns_content.substr(second_semi + 1, third_semi - second_semi - 1);
+                                std::replace(val3_str.begin(), val3_str.end(), ',', '.');
+                                
+                                // Mise à jour thread-safe des globales
+                                float power = atof(val1_str.c_str());
+                                float panel = atof(val2_str.c_str());
+                                float routage = atof(val3_str.c_str());
+                                float power_charger;
+                                float power_GTN;
+                                int t = 0;
+
+                                // Mettre à jour seulement si changement > 0.5W
+                                if (fabs(power - last_power) > 0.5) {
+                                  id(latest_power) = power;
+                                  last_power = power;
+                                  id(consommation_maison).publish_state(power);
+                                  
+                                  if (power < 20.0 && power > -20.0 && routage < 290.0) {
+                                    // Ne rien faire dans ce cas
+                                  } 
+                                  else {
+                                    power_charger = power;
+                                    id(minipid_Emerson_input_smoothed).publish_state(power_charger);
+                                  }
+
+                                  power_GTN = power - routage * 6.87;
+                                  id(minipid_GTN_input_smoothed).publish_state(power_GTN);
+                                  t = 1;
+                                }
+                                
+                                if (fabs(panel - last_panel) > 0.5) {
+                                  id(latest_panel) = panel;
+                                  last_panel = panel;
+                                  id(puissance_panneau).publish_state(panel);
+                                }
+
+                                if (fabs(routage - last_routage) > 0.5) {
+                                  id(latest_routage) = routage;
+                                  last_routage = routage;
+                                  id(routage_cumulus).publish_state(routage);
+
+                                  if (power < 20.0 && power > -20.0 && routage < 290.0) {
+                                    power_charger = (100 - routage * 6.87);
+                                    id(minipid_Emerson_input_smoothed).publish_state(power_charger);
+                                  } 
+
+                                  if (t == 0) {
+                                    power_GTN = power - routage * 6.87;
+                                    id(minipid_GTN_input_smoothed).publish_state(power_GTN);
+                                  }
+                                }
+                                
+                                // Incrémenter le compteur de succès
+                                id(http_success_count)++;
+                                
+                                ESP_LOGD("http_task", "Power: %.1f W, Panel: %.1f W, Routage: %.1f W (en %d ms, délai: %d ms)", 
+                                        power, panel, routage, millis() - start, delay_ms);
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    esp_http_client_close(client);
+                  } else {
+                    ESP_LOGW("http_task", "Erreur connexion HTTP: %s", esp_err_to_name(err));
+                    id(http_error_count)++;
+                  }
+                } else {
+                  ESP_LOGD("http_task", "Collecte désactivée - en attente");
+                }
+                
+                // Attendre le délai configuré dynamiquement
+                vTaskDelay(delay_ms / portTICK_PERIOD_MS);
+              }
+              
+              esp_http_client_cleanup(client);
+            },
+            "HTTP_Task",
+            8192,
+            NULL,
+            0,
+            NULL,
+            0  // Core 0
+          );
+          
+          ESP_LOGI("main", "Tâche HTTP créée sur core 0 avec délai variable");
+
+      - script.execute: check_for_sleep_prevention      
+      
+      - delay: 100ms
+      - logger.log: "Initialisation terminée, démarrage du bus CAN"
+
+      - number.set:
+          id:  ${emerson_r48}_set_output_voltage
+          value: 56.6
+
+      - number.set:
+          id:  ${emerson_r48}_set_output_max_current
+          value: 10
+
+      - number.set:
+          id:  ${emerson_r48}_set_input_current
+          value: 6  
+      - switch.turn_on:                             
+          id:  ${emerson_r48}_ac_sw
+      - switch.turn_on:                             
+          id:  ${emerson_r48}_dc_sw
+      - delay: 5s   # laisse le temps au capteur `ah` de restaurer sa valeur
+      - lambda: |-
+            if (id(ina_ah).state > 50.025) {
+              id(ina_lost_ah) += id(ina_ah).state - 50.0;
+              ESP_LOGI("init_check", "Valeur AH au démarrage au-dessus de 50Ah, correction appliquée.");
+              id(ina_ah).reset();
+            }                          
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 16MB
+  partitions: partitions.csv
+  framework:
+    type: esp-idf
+    version: recommended
+
+logger:
+#  level: VERBOSE
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+
+# Ajustements de partition pour profiter des 16Mo
+esp32_improv:
+  authorizer: none
+
+
+
+debug:
+  update_interval: 5s
+
+
+globals:
+  - id: ina_lost_ah
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+  - id: power_value
+    type: float
+    restore_value: no
+    initial_value: '0.0'    
+  - id: latest_power
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: latest_panel
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: latest_routage
+    type: float
+    restore_value: no
+    initial_value: '0.0'    
+  - id: http_task_enabled
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: http_success_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: http_error_count
+    type: int
+    restore_value: no
+    initial_value: '0'    
+  
+    
+
+
+
+substitutions:
+  name: jk-bms 
+  bms0: "${name} 55Ah"
+  bms1: "batterie vélo"
+  GTN:  "Onduleur Soyosource"
+  emerson_r48 : "emerson_r48"
+  digipot: "digipot"
+  device_description: "Monitor and control a JK-BMS via bluetooth"
+  external_components_source: github://syssi/esphome-jk-bms@main
+  mac_address: 20:22:08:25:1F:8F
+  external_components_source_1: github://syssi/esphome-jbd-bms@main
+  external_components_source_2: github://syssi/esphome-soyosource-gtn-virtual-meter@main
+  external_components_source_3: external_components
+# external_components_source_4: http://github.com/Kylevdm/esphome-emerson-vertiv-r48
+  external_components_source_4: http://github.com/IxioJo/esphome-emerson-vertiv-r48
+  
+  # Please use "JK02_24S" if you own a old JK-BMS < hardware version 11.0 (hardware version >= 6.0 and < 11.0)
+  # Please use "JK02_32S" if you own a new JK-BMS >= hardware version 11.0 (f.e. JK-B2A8S20P hw 11.XW, sw 11.26)
+  # Please use "JK04" if you have some old JK-BMS <= hardware version 3.0 (f.e. JK-B2A16S hw 3.0, sw. 3.3.0)
+  protocol_version: JK02_32S
+  mac_address_1: A5:C2:37:28:A3:70
+
+  tx_pin_GTN:   GPIO1
+  rx_pin_GTN:   GPIO8
+  spi_clk_pin:  GPIO07
+  spi_mosi_pin: GPIO06
+  spi_miso_pin: GPIO05
+  spi_CS_pin:   GPIO15
+  spi_CS_pin_2: GPIO10
+  switch1_pin:  GPIO04
+  i2c_sda_pin:  GPIO17
+  i2c_scl_pin:  GPIO18
+
+
+  minipid_id : minipid_GTN
+  minipid_name : minipid_GTN
+  minipid_id2 : minipid_Emerson
+  minipid_name2 : minipid_Emerson
+ 
+
+
+
+
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "ec1rTq/jz3godkuEawMHyMm+mywiY0IO4pNfrVFSRTQ="
+  reboot_timeout: 0s  
+
+  #services:
+  #- service: control_pot
+  #  variables:
+  #    level: float
+  #  then:
+  #    - number.set: 
+  #        id: digipot_level
+  #        value: !lambda "return level * 100;"  
+
+ota:
+  - platform: esphome
+    password: XXXXXXX
+    on_begin:
+      then:
+        - switch.turn_off: ble_client_switch0
+        - logger.log: "BLE connection suspended for OTA update"
+    
+
+
+wifi:
+  networks:
+
+
+    - ssid: !secret wifi_ssid2
+      password: !secret wifi_password
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password    
+  fast_connect: false  # (facultatif) met à true si tous les SSID sont cachés
+  reboot_timeout: 5min # redémarre si aucune connexion Wi-Fi pendant 5 min        
+
+
+# Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Esp-Batterie Fallback Hotspot"
+    password: XXXXXXXXX
+
+captive_portal:
+
+
+web_server:
+  port: 80
+  version: 3
+
+
+
+spi:
+  clk_pin: ${spi_clk_pin}
+  mosi_pin: ${spi_mosi_pin}
+  miso_pin: ${spi_miso_pin}
+  id: McpSpi
+  interface: spi3
+  #interface: software
+
+i2c:
+  sda: ${i2c_sda_pin}
+  scl: ${i2c_scl_pin}
+  scan: true
+  id: bus_a
+  sda_pullup_enabled: True
+  scl_pullup_enabled: True
+  timeout: 1s
+  frequency: 100kHz
+
+
+canbus:
+  - platform: mcp2515
+    id: can
+    spi_id: McpSpi
+    use_extended_id: true
+    cs_pin: ${spi_CS_pin_2}
+    can_id: 0x0607FF83
+    bit_rate: 125kbps
+    mode: NORMAL
+    data_rate: 4Mhz
+    #spi_mode: 0
+
+
+
+external_components:
+  - source: ${external_components_source}
+    refresh: 1d
+  - source: ${external_components_source_1}
+    refresh: 1d
+  - source: ${external_components_source_2}
+    refresh: 1d
+  - source: 
+      type: local
+      path: ${external_components_source_3}
+  - source: 
+      type: git
+      url: ${external_components_source_4}
+      ref: IxioJo-patch-1
+      #ref: main
+    refresh: 0s
+
+  - source: "github://IxioJo/myESPhome/"
+    components: [minipid]
+    refresh: 0s    
+
+uart:
+  - id: uart_0
+    baud_rate: 4800
+    tx_pin: ${tx_pin_GTN}
+    rx_pin: ${rx_pin_GTN}
+
+
+
+# MCP41010
+# mcp41010:
+ # id: my_pot
+ # cs_pin: ${spi_CS_pin}
+#
+
+esp32_ble_tracker:
+  on_ble_advertise:
+    then:
+      - lambda: |-
+          if (x.get_name().rfind("JK-", 0) == 0 || x.get_name().rfind("JK_", 0) == 0) {
+            ESP_LOGI("ble_adv", "New JK-BMS found");
+            ESP_LOGI("ble_adv", "  Name: %s", x.get_name().c_str());
+            ESP_LOGI("ble_adv", "  MAC address: %s", x.address_str().c_str());
+            ESP_LOGD("ble_adv", "  Advertised service UUIDs:");
+            for (auto uuid : x.get_service_uuids()) {
+              ESP_LOGD("ble_adv", "    - %s", uuid.to_string().c_str());
+            }
+          }
+
+ble_client:
+  - mac_address: ${mac_address}
+    id: client0
+  - mac_address: ${mac_address_1}
+    id: client1
+
+jk_bms_ble:
+  - ble_client_id: client0
+    protocol_version: ${protocol_version}
+    throttle: 2s
+    id: bms0
+
+jbd_bms_ble:
+  - id: bms1
+    ble_client_id: client1
+    update_interval: 5s
+    
+
+soyosource_modbus:
+  - id: modbus0
+    uart_id: uart_0
+    # flow_control_pin: GPIO12
+
+    # Optional settings
+    #
+    # The name is used as prefix for some log messages and should
+    # help to distinguish between different instances/devices
+    name: Onduleur_GTN
+
+soyosource_virtual_meter:
+  - id: virtualmeter0
+    soyosource_modbus_id: modbus0
+
+    # The state of this sensor (instantaneous power in watt) is used as source
+    power_id: powermeter0
+
+    # Optional settings
+    power_sensor_inactivity_timeout: 20s
+   # power_demand_calculation: NEGATIVE_MEASUREMENTS_REQUIRED
+    min_power_demand: 0
+    max_power_demand: 1200
+    zero_output_on_min_power_demand: true
+    # Split/distribute the power demand if you have multiple inverters attached to the same RS485 bus
+    power_demand_divider: 1
+    # A positive buffer value (10) tries to avoid exporting power to the grid (demand - 10 watts)
+    # A negative buffer value (-10) exports power to the grid (demand + 10 watts)
+    buffer: 10
+    # The operation_status_id sensor is expected here. Passing the operation_status won't work
+    # The state is used to suspend the limiter if the operation status of the inverter isn't 0x0 (normal)
+    # operation_status_id: operation_status_id0
+
+    # The update interval is important and defaults to 3 seconds. If the demand is sent too frequently
+    # or rarely the interverter stops. TODO: Identify and validate the lower and upper update limit
+    update_interval: 1s
+
+#soyosource_inverter:
+#  - id: inverter0
+#    soyosource_modbus_id: modbus0
+#
+
+emerson_r48:
+  canbus_id: can
+  update_interval: 1s
+
+
+
+http_request:
+  id: http_request_component
+  useragent: esphome/energy-monitor
+  timeout: 10s
+
+time:
+  - platform: sntp
+    id: my_time    
+
+minipid:
+  - id: ${minipid_id}
+    input_id: ${minipid_name}_input_smoothed  
+    output_id: soyosource_pid_out
+
+  - id: ${minipid_id2}
+    input_id: ${minipid_name2}_input_smoothed  
+    output_id: emerson_pid_out
+
+
+binary_sensor:
+  - platform: jk_bms_ble
+    
+    balancing:
+      name: "${bms0} balancing"
+      device_id: JKBMS_55Ah
+    charging:
+      name: "${bms0} charging"
+      device_id: JKBMS_55Ah
+    discharging:
+      name: "${bms0} discharging"
+      device_id: JKBMS_55Ah
+    heating:
+      name: "${bms0} heating"
+      device_id: JKBMS_55Ah
+    online_status:
+      name: "${bms0} online status"
+      device_id: JKBMS_55Ah
+
+
+  - platform: jbd_bms_ble
+    jbd_bms_ble_id: bms1
+    balancing:
+      name: "${bms1} balancing"
+      device_id: JBD_BMS
+    charging:
+      name: "${bms1} charging"
+      device_id: JBD_BMS
+    discharging:
+      name: "${bms1} discharging"
+      device_id: JBD_BMS
+    online_status:
+      name: "${bms1} online status"
+      device_id: JBD_BMS
+
+  - platform: homeassistant
+    id: esp_batterie_sleep_mode
+    entity_id: input_boolean.esp_batterie_sleep_mode
+
+#  - platform: soyosource_inverter
+#    soyosource_inverter_id: inverter0
+#    fan_running:
+#      name: "${GTN} fan running"
+
+button:
+  - platform: jk_bms_ble
+    retrieve_settings:
+      name: "${bms0} retrieve settings"
+      device_id: JKBMS_55Ah
+    retrieve_device_info:
+      name: "${bms0} retrieve device info"
+      device_id: JKBMS_55Ah
+      
+
+#
+#  - platform: template
+#    name: "Digipot PLUS"
+#    id: digipot_plus
+#    on_press:
+#      - logger.log: Button PLUS Pressed
+#      - number.increment: digipot_level
+#
+#  - platform: template
+#    name: Digipot MINUS
+#    id: digipot_minus
+#    on_press:
+#      - logger.log: Button MINUS Pressed
+#       
+#      - number.decrement: digipot_level
+#
+#  - platform: template
+#    name: Digipot SETLOW
+#    id: digipot_setlow
+#    on_press:
+#      - logger.log: Button LOW Pressed
+#      
+#      - number.set :
+#          id : digipot_level
+#          value : 0
+#
+#  - platform: template
+#    name: Digipot SETHIGH
+#    id: digipot_sethigh
+#    on_press:
+#      - logger.log: Button HIGH Pressed
+#      
+#      - number.set :
+#          id : digipot_level
+#          value : 255
+  - platform: restart
+    name: "Restart"      
+
+
+  - platform: emerson_r48
+    set_offline_values:
+      name:  ${emerson_r48}_Set offline values
+      device_id: Emerson
+
+  - platform : template 
+    name : reset lost current
+    device_id: ina
+    on_press:
+              
+        - lambda: |-
+            id(ina_lost_ah) = 0.0;         
+   
+
+#output:
+#- platform: custom
+#  type: float
+#  lambda: |-
+#    auto custom_digipot_output = new CustomDigipotOutput();
+#    App.register_component(custom_digipot_output);
+#    return {custom_digipot_output};
+#  outputs:
+#    id: boiler_digipot
+  - platform: template
+    name: "Réinitialiser statistiques HTTP"
+    icon: mdi:restart
+    on_press:
+      - lambda: |-
+          id(http_success_count) = 0;
+          id(http_error_count) = 0;
+          ESP_LOGI("button", "Statistiques HTTP réinitialisées");
+
+number:
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    balance_trigger_voltage:
+      name: "${bms0} balance trigger voltage"
+      device_id: JKBMS_55Ah
+    cell_count:
+      name: "${bms0} cell count"
+      device_id: JKBMS_55Ah
+    total_battery_capacity:
+      name: "${bms0} total battery capacity"
+      device_id: JKBMS_55Ah
+    cell_voltage_overvoltage_protection:
+      name: "${bms0} cell voltage overvoltage protection"
+      device_id: JKBMS_55Ah
+    cell_voltage_overvoltage_recovery:
+      name: "${bms0} cell voltage overvoltage recovery"
+      device_id: JKBMS_55Ah
+    cell_voltage_undervoltage_protection:
+      name: "${bms0} cell voltage undervoltage protection"
+      device_id: JKBMS_55Ah
+    cell_voltage_undervoltage_recovery:
+      name: "${bms0} cell voltage undervoltage recovery"
+      device_id: JKBMS_55Ah
+    balance_starting_voltage:
+      name: "${bms0} balance starting voltage"
+      device_id: JKBMS_55Ah
+    voltage_calibration:
+      name: "${bms0} voltage calibration"
+      device_id: JKBMS_55Ah
+    current_calibration:
+      name: "${bms0} current calibration"
+      device_id: JKBMS_55Ah
+    power_off_voltage:
+      name: "${bms0} power off voltage"
+      device_id: JKBMS_55Ah
+    max_balance_current:
+      name: "${bms0} max balance current"
+      device_id: JKBMS_55Ah
+    max_charge_current:
+      name: "${bms0} max charge current"
+      device_id: JKBMS_55Ah
+    max_discharge_current:
+      name: "${bms0} max discharge current"
+      device_id: JKBMS_55Ah
+    charge_overcurrent_protection_delay:
+      name: "${bms0} charge overcurrent protection delay"
+      device_id: JKBMS_55Ah
+    charge_overcurrent_protection_recovery_time:
+      name: "${bms0} charge overcurrent protection recovery time"
+      device_id: JKBMS_55Ah
+    discharge_overcurrent_protection_delay:
+      name: "${bms0} discharge overcurrent protection delay"
+      device_id: JKBMS_55Ah
+    discharge_overcurrent_protection_recovery_time:
+      name: "${bms0} discharge overcurrent protection recovery time"
+      device_id: JKBMS_55Ah
+    short_circuit_protection_delay:
+      name: "${bms0} short circuit protection delay"
+      device_id: JKBMS_55Ah
+    short_circuit_protection_recovery_time:
+      name: "${bms0} short circuit protection recovery time"
+      device_id: JKBMS_55Ah
+    charge_overtemperature_protection:
+      name: "${bms0} charge overtemperature protection"
+      device_id: JKBMS_55Ah
+    charge_overtemperature_protection_recovery:
+      name: "${bms0} charge overtemperature protection recovery"
+      device_id: JKBMS_55Ah
+    discharge_overtemperature_protection:
+      name: "${bms0} discharge overtemperature protection"
+      device_id: JKBMS_55Ah
+    discharge_overtemperature_protection_recovery:
+      name: "${bms0} discharge overtemperature protection recovery"
+      device_id: JKBMS_55Ah
+    charge_undertemperature_protection:
+      name: "${bms0} charge undertemperature protection"
+      device_id: JKBMS_55Ah
+    charge_undertemperature_protection_recovery:
+      name: "${bms0} charge undertemperature protection recovery"
+      device_id: JKBMS_55Ah
+    power_tube_overtemperature_protection:
+      name: "${bms0} power tube overtemperature protection"
+      device_id: JKBMS_55Ah
+    power_tube_overtemperature_protection_recovery:
+      name: "${bms0} power tube overtemperature protection recovery"
+      device_id: JKBMS_55Ah
+
+#  - platform: template
+#    name: "Digipot level"
+#    id: digipot_level
+#    optimistic: true
+#    min_value: 0
+#    max_value: 255
+#    initial_value: 0
+#    step: 1
+#    mode: slider
+#    on_value:
+#      then:
+#        - lambda: |-
+#            id(my_pot).set_value(id(digipot_level).state);
+
+  - platform: soyosource_virtual_meter
+    soyosource_virtual_meter_id: virtualmeter0
+    buffer:
+      name: "${GTN} buffer"
+      initial_value: 10
+      restore_value: true
+      device_id: Soyosource
+    manual_power_demand:
+      name: "${GTN} manual power demand"
+      max_value: 900
+      device_id: Soyosource
+      id: onduleur_soyosource_manual_power_demand
+    max_power_demand:
+      name: "${GTN} max power demand"
+      initial_value: 600
+      max_value: 900
+      restore_value: true
+      device_id: Soyosource
+    power_demand_divider:
+      name: "${GTN} power demand divider"
+      initial_value: 1
+      restore_value: true
+      device_id: Soyosource
+
+  - platform: emerson_r48
+    output_voltage:
+      name: ${emerson_r48}_Set output voltage
+      id: ${emerson_r48}_set_output_voltage
+      device_id: Emerson
+    max_output_current:
+      name: ${emerson_r48}_Max output current
+      unit_of_measurement: '%'
+      id: ${emerson_r48}_set_output_max_current
+      device_id: Emerson
+      
+    max_input_current:
+      name: ${emerson_r48}_Max input current
+      id: ${emerson_r48}_set_input_current
+      device_id: Emerson
+
+  - platform: template
+    max_value: 20
+    min_value: -20
+    step: 0.001
+    name: current_offset
+    device_id: ina
+    id: current_offset
+    initial_value: 0
+    optimistic: true
+
+  - platform: minipid
+    minipid_id: ${minipid_id}
+    setpoint: 
+      name: ${minipid_name}_setpoint
+      device_id: Soyosource
+    kp: 
+      name: ${minipid_name}_kp
+      device_id: Soyosource
+    ki: 
+      name: ${minipid_name}_ki
+      device_id: Soyosource
+    kd: 
+      name: ${minipid_name}_kd
+      device_id: Soyosource
+    output_min: 
+      name: ${minipid_name}_output_min
+      device_id: Soyosource
+    output_max: 
+      name: ${minipid_name}_output_max      
+      device_id: Soyosource
+
+  - platform: minipid
+    minipid_id: ${minipid_id2}
+    setpoint: 
+      name: ${minipid_name2}_setpoint
+      device_id: Emerson
+    kp: 
+      name: ${minipid_name2}_kp
+      device_id: Emerson
+    ki: 
+      name: ${minipid_name2}_ki
+      device_id: Emerson
+    kd: 
+      name: ${minipid_name2}_kd
+      device_id: Emerson
+    output_min: 
+      name: ${minipid_name2}_output_min
+      device_id: Emerson
+    output_max: 
+      name: ${minipid_name2}_output_max
+      id: ${minipid_name2}_output_max            
+      device_id: Emerson
+
+  - platform: homeassistant
+    id: battery_actual_max_current
+    entity_id: number.battery_actual_max_current
+    on_value: 
+      then:
+        - number.set:
+           id: ${minipid_name2}_output_max      
+           value: !lambda 'return x/15.8*30;'
+
+  - platform: template
+    name: "Délai actualisation HTTP"
+    id: http_polling_interval
+    icon: mdi:timer-outline
+    min_value: 100
+    max_value: 10000
+    step: 50
+    initial_value: 250
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "ms"
+    mode: box
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGI("number", "Délai actualisation changé à %.0f ms", x);
+
+output:
+  - platform: template 
+    id: soyosource_pid_out
+
+    type: float
+    write_action:
+      - number.set:
+          id: onduleur_soyosource_manual_power_demand
+          value: !lambda 'return state * 900.0;'
+  - platform: template 
+    id: emerson_pid_out
+
+    type: float
+    write_action:
+      - number.set:
+          id: emerson_r48_set_output_max_current
+          value: !lambda 'return state * 100.0;'
+
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal Sensor"
+    update_interval: 5s
+
+
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    
+    min_cell_voltage:
+      name: "${bms0} min cell voltage"
+      accuracy_decimals: 3
+      device_id: JKBMS_55Ah
+      web_server:
+        sorting_weight: 10
+    max_cell_voltage:
+      name: "${bms0} max cell voltage"
+      accuracy_decimals: 3
+      device_id: JKBMS_55Ah
+      
+    min_voltage_cell:
+      name: "${bms0} min voltage cell"
+      device_id: JKBMS_55Ah
+    max_voltage_cell:
+      name: "${bms0} max voltage cell"
+      device_id: JKBMS_55Ah
+    delta_cell_voltage:
+      name: "${bms0} delta cell voltage"
+      accuracy_decimals: 3
+      device_id: JKBMS_55Ah
+    average_cell_voltage:
+      name: "${bms0} average cell voltage"
+      accuracy_decimals: 3
+      device_id: JKBMS_55Ah
+    cell_voltage_1:
+      name: "${bms0} cell voltage 1"
+      accuracy_decimals: 3
+      device_id: JKBMS_55Ah
+    cell_voltage_2:
+      name: "${bms0} cell voltage 2"
+      device_id: JKBMS_55Ah
+    cell_voltage_3:
+      name: "${bms0} cell voltage 3"
+      device_id: JKBMS_55Ah
+    cell_voltage_4:
+      name: "${bms0} cell voltage 4"
+      device_id: JKBMS_55Ah
+    cell_voltage_5:
+      name: "${bms0} cell voltage 5"
+      device_id: JKBMS_55Ah
+    cell_voltage_6:
+      name: "${bms0} cell voltage 6"
+      device_id: JKBMS_55Ah
+    cell_voltage_7:
+      name: "${bms0} cell voltage 7"
+      device_id: JKBMS_55Ah
+    cell_voltage_8:
+      name: "${bms0} cell voltage 8"
+      device_id: JKBMS_55Ah
+    cell_voltage_9:
+      name: "${bms0} cell voltage 9"
+      device_id: JKBMS_55Ah
+    cell_voltage_10:
+      name: "${bms0} cell voltage 10"
+      device_id: JKBMS_55Ah
+    cell_voltage_11:
+      name: "${bms0} cell voltage 11"
+      device_id: JKBMS_55Ah
+    cell_voltage_12:
+      name: "${bms0} cell voltage 12"
+      device_id: JKBMS_55Ah
+    cell_voltage_13:
+      name: "${bms0} cell voltage 13"
+      device_id: JKBMS_55Ah
+    cell_voltage_14:
+      name: "${bms0} cell voltage 14"
+      device_id: JKBMS_55Ah
+    cell_voltage_15:
+      name: "${bms0} cell voltage 15"                  
+      device_id: JKBMS_55Ah
+    cell_voltage_16:
+      name: "${bms0} cell voltage 16"      
+      device_id: JKBMS_55Ah
+    cell_resistance_1:
+      name: "${bms0} cell resistance 1"
+      device_id: JKBMS_55Ah
+    cell_resistance_2:
+      name: "${bms0} cell resistance 2"
+      device_id: JKBMS_55Ah
+    cell_resistance_3:
+      name: "${bms0} cell resistance 3"
+      device_id: JKBMS_55Ah
+    cell_resistance_4:
+      name: "${bms0} cell resistance 4"
+      device_id: JKBMS_55Ah
+    cell_resistance_5:
+      name: "${bms0} cell resistance 5"
+      device_id: JKBMS_55Ah
+    cell_resistance_6:
+      name: "${bms0} cell resistance 6"
+      device_id: JKBMS_55Ah
+    cell_resistance_7:
+      name: "${bms0} cell resistance 7"
+      device_id: JKBMS_55Ah
+    cell_resistance_8:
+      name: "${bms0} cell resistance 8"
+      device_id: JKBMS_55Ah
+    cell_resistance_9:
+      name: "${bms0} cell resistance 9"
+      device_id: JKBMS_55Ah
+    cell_resistance_10:
+      name: "${bms0} cell resistance 10"
+      device_id: JKBMS_55Ah
+    cell_resistance_11:
+      name: "${bms0} cell resistance 11"
+      device_id: JKBMS_55Ah
+    cell_resistance_12:
+      name: "${bms0} cell resistance 12"
+      device_id: JKBMS_55Ah
+    cell_resistance_13:
+      name: "${bms0} cell resistance 13"
+      device_id: JKBMS_55Ah
+    cell_resistance_14:
+      name: "${bms0} cell resistance 14"
+      device_id: JKBMS_55Ah
+    cell_resistance_15:
+      name: "${bms0} cell resistance 15"
+      device_id: JKBMS_55Ah
+    cell_resistance_16:
+      name: "${bms0} cell resistance 16"      
+      device_id: JKBMS_55Ah
+
+    total_voltage:
+      name: "${bms0} total voltage"
+      device_id: JKBMS_55Ah
+    current:
+      name: "${bms0} current"
+      device_id: JKBMS_55Ah
+
+    power:
+      name: "${bms0} power"
+      device_id: JKBMS_55Ah
+    charging_power:
+      name: "${bms0} charging power"
+      device_id: JKBMS_55Ah
+    discharging_power:
+      name: "${bms0} discharging power"
+      device_id: JKBMS_55Ah
+    temperature_sensor_1:
+      name: "${bms0} temperature sensor 1"
+      device_id: JKBMS_55Ah
+    temperature_sensor_2:
+      name: "${bms0} temperature sensor 2"
+      device_id: JKBMS_55Ah
+    # temperature_sensor_3:
+    #   name: "${bms0} temperature sensor 3"
+    # temperature_sensor_4:
+    #   name: "${bms0} temperature sensor 4"
+    power_tube_temperature:
+      name: "${bms0} power tube temperature"
+      device_id: JKBMS_55Ah
+    balancing:
+      name: "${bms0} balancing"
+      device_id: JKBMS_55Ah
+    state_of_charge:
+      name: "${bms0} state of charge"
+      device_id: JKBMS_55Ah
+    capacity_remaining:
+      name: "${bms0} capacity remaining"
+      device_id: JKBMS_55Ah
+    total_battery_capacity_setting:
+      name: "${bms0} total battery capacity setting"
+      device_id: JKBMS_55Ah
+    charging_cycles:
+      name: "${bms0} charging cycles"
+      device_id: JKBMS_55Ah
+    total_charging_cycle_capacity:
+      name: "${bms0} total charging cycle capacity"
+      device_id: JKBMS_55Ah
+    total_runtime:
+      name: "${bms0} total runtime"
+      device_id: JKBMS_55Ah
+    balancing_current:
+      name: "${bms0} balancing current"
+      device_id: JKBMS_55Ah
+    errors_bitmask:
+      name: "${bms0} errors bitmask"
+      device_id: JKBMS_55Ah
+
+  - platform: jbd_bms_ble
+    jbd_bms_ble_id: bms1
+    power:
+      name: "${bms1} power"
+      device_id: JBD_BMS
+    state_of_charge:
+      name: "${bms1} state of charge"
+      device_id: JBD_BMS
+    total_voltage:
+      name: "${bms1} total voltage"
+      device_id: JBD_BMS
+    average_cell_voltage:
+      name: "${bms1} average cell voltage"
+      device_id: JBD_BMS
+    delta_cell_voltage:
+      name: "${bms1} delta cell voltage"
+      device_id: JBD_BMS
+    battery_strings:
+      name: "${bms1} battery strings"
+      device_id: JBD_BMS
+    current:
+      name: "${bms1} current"
+      device_id: JBD_BMS
+    charging_power:
+      name: "${bms1} charging power"
+      device_id: JBD_BMS
+    discharging_power:
+      name: "${bms1} discharging power"
+      device_id: JBD_BMS
+    nominal_capacity:
+      name: "${bms1} nominal capacity"
+      device_id: JBD_BMS
+    charging_cycles:
+      name: "${bms1} charging cycles"
+      device_id: JBD_BMS
+    capacity_remaining:
+      name: "${bms1} capacity remaining"
+      device_id: JBD_BMS
+    battery_cycle_capacity:
+      name: "${bms1} battery cycle capacity"
+      device_id: JBD_BMS
+    min_cell_voltage:
+      name: "${bms1} min cell voltage"
+      device_id: JBD_BMS
+    max_cell_voltage:
+      name: "${bms1} max cell voltage"
+      device_id: JBD_BMS
+    min_voltage_cell:
+      name: "${bms1} min voltage cell"
+      device_id: JBD_BMS
+    max_voltage_cell:
+      name: "${bms1} max voltage cell"
+      device_id: JBD_BMS
+    temperature_1:
+      name: "${bms1} temperature 1"
+      device_id: JBD_BMS
+    temperature_2:
+      name: "${bms1} temperature 2"
+      device_id: JBD_BMS
+    cell_voltage_1:
+      name: "${bms1} cell voltage 1"
+      device_id: JBD_BMS
+    cell_voltage_2:
+      name: "${bms1} cell voltage 2"
+      device_id: JBD_BMS
+    cell_voltage_3:
+      name: "${bms1} cell voltage 3"
+      device_id: JBD_BMS
+    cell_voltage_4:
+      name: "${bms1} cell voltage 4"
+      device_id: JBD_BMS
+    cell_voltage_5:
+      name: "${bms1} cell voltage 5"
+      device_id: JBD_BMS
+    cell_voltage_6:
+      name: "${bms1} cell voltage 6"
+      device_id: JBD_BMS
+    cell_voltage_7:
+      name: "${bms1} cell voltage 7"
+      device_id: JBD_BMS
+    cell_voltage_8:
+      name: "${bms1} cell voltage 8"
+      device_id: JBD_BMS
+    cell_voltage_9:
+      name: "${bms1} cell voltage 9"
+      device_id: JBD_BMS
+    cell_voltage_10:
+      name: "${bms1} cell voltage 10"
+      device_id: JBD_BMS
+    operation_status_bitmask:
+      name: "${bms1} operation status bitmask"
+      device_id: JBD_BMS
+    errors_bitmask:
+      name: "${bms1} errors bitmask"
+      device_id: JBD_BMS
+    balancer_status_bitmask:
+      name: "${bms1} balancer status bitmask"
+      device_id: JBD_BMS
+    software_version:
+      name: "${bms1} software version"    
+      device_id: JBD_BMS
+
+  - platform: soyosource_virtual_meter
+    soyosource_virtual_meter_id: virtualmeter0
+    power_demand:
+      name: "${GTN} power demand"
+      device_id: Soyosource
+
+  #- platform: soyosource_inverter
+  #  soyosource_inverter_id: inverter0
+  #  operation_status_id:
+  #    name: "${GTN} operation status id"
+  #    id: operation_status_id0
+  #  battery_voltage:
+  #    name: "${GTN} battery voltage"
+  #  battery_current:
+  #    name: "${GTN} battery current"
+  #  battery_power:
+  #    name: "${GTN} battery power"
+  #  ac_voltage:
+  #    name: "${GTN} ac voltage"
+  #  ac_frequency:
+  #    name: "${GTN} ac frequency"
+  #  temperature:
+  #    name: "${GTN} temperature"
+
+
+
+   # import smartmeter reading from homeassistant
+   # requires the "api" component see above
+  - platform: homeassistant
+    id: powermeter0
+    name: "${GTN} smartmeter instantaneous power"
+    entity_id: sensor.real_power_demand
+   # filters:
+   #   - throttle_average: 15s  
+    filters:
+      - sliding_window_moving_average:
+         
+         window_size: 15
+         send_every: 2
+    device_id: Soyosource         
+
+  - platform: emerson_r48
+     
+    output_voltage:
+      name: ${emerson_r48}_Output voltage
+      id: ${emerson_r48}_DC_Voltage
+      device_id: Emerson
+
+    output_current:
+      name: ${emerson_r48}_Output current
+      id: ${emerson_r48}_DC_Current
+      device_id: Emerson
+    output_temp:
+      name: ${emerson_r48}_Temperature
+      device_id: Emerson
+    input_voltage:
+      name: ${emerson_r48}_AC Voltage
+      device_id: Emerson
+    max_output_current:
+      name: ${emerson_r48}_DC max current
+      unit_of_measurement: '%'    
+      device_id: Emerson
+
+
+
+  - platform: ina226
+    address: 0x50
+    shunt_resistance: 0.001470 ohm
+    max_current: 50A
+    # adc time used for both, Bus Voltage and Shunt Voltage
+    adc_time: 332us
+    adc_averaging: 64
+    update_interval: 1s
+    i2c_id: bus_a
+
+    current:
+      name: "INA226 Current"
+      device_id: ina
+      device_class: current
+      state_class: measurement
+      id: ina_current
+      filters:
+        - offset: !lambda return id(current_offset).state;
+    power:
+      name: "INA226 Power"
+      id: ina_power
+      device_id: ina
+      device_class: power
+      state_class: measurement
+      filters:
+       - multiply: 2.014
+    bus_voltage:
+      name: "INA226 Bus Voltage"
+      device_id: ina
+      device_class: voltage
+      state_class: measurement
+      filters:
+       - multiply: 2.014
+      id: ina_voltage 
+    shunt_voltage:
+      name: "INA226 Shunt Voltage"
+      device_id: ina
+      unit_of_measurement: mV
+      accuracy_decimals: 3
+      filters:
+       - lambda: return x*1000;
+
+
+  - platform: integration
+    name: AH Data
+    device_id: ina
+    id: ina_ah
+    sensor: ina_current
+    time_unit: h
+    restore: true
+    unit_of_measurement: Ah
+    integration_method: right
+    accuracy_decimals: 3
+    filters:
+     - lambda: return x + 50;
+    disabled_by_default: true
+    internal: true
+# Getting AH
+  - platform: template
+    name: Battery Capacity
+    device_id: ina
+    unit_of_measurement: Ah
+    device_class: energy_storage
+    state_class: measurement
+    accuracy_decimals: 3
+    lambda: |-
+      return (id(ina_ah).state * 1);
+    update_interval: 2s          
+    on_value_range:
+        - above: 50.025
+          then:
+           - delay: 10s
+           - lambda: |-
+                ESP_LOGI("update_lost_ah", "lost_ah = %f", id(ina_lost_ah));
+                id(ina_lost_ah) += id(ina_ah).state - 50.0;
+                
+           - sensor.integration.reset: ina_ah
+
+
+  - platform: template
+    name: inPower
+    device_id: ina
+    id: ina_inpower
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    update_interval: 1s 
+    accuracy_decimals: 2
+    lambda: |-
+      if(id(ina_current).state>0) { return ( id(ina_current).state * id(ina_voltage).state ); } 
+      else {return 0;}
+
+  - platform: template
+    name: outPower
+    device_id: ina
+    id: ina_outpower
+    unit_of_measurement: W
+    state_class: measurement
+    device_class: power
+    update_interval: 1s 
+    accuracy_decimals: 2
+    lambda: |-
+      if(id(ina_current).state<0) { return ( id(ina_current).state * id(ina_voltage).state *-1 ); } 
+      else {return 0;}     
+    
+  - platform: template
+    name: Lost Current
+    device_id: ina
+    id: ina_lost_current
+    unit_of_measurement: Ah
+    device_class: energy_storage
+    state_class: total_increasing
+    update_interval: 10s
+    accuracy_decimals: 3
+    lambda: |-
+      return id(ina_lost_ah);
+    
+
+  - platform: integration
+    name: inEnergy
+    device_id: ina
+    id: ina_inenergy
+    sensor: ina_inpower
+    device_class: energy  
+    state_class: total_increasing
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    integration_method: right
+    accuracy_decimals: 2
+    filters:
+     - lambda: return x/1000;
+    disabled_by_default: false
+
+  - platform: integration
+    name: outEnergy
+    device_id: ina
+    id: ina_outenergy
+    sensor: ina_outpower
+    device_class: energy
+    state_class: total_increasing
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    integration_method: right
+    accuracy_decimals: 2
+    filters:
+     - lambda: return x/1000;
+    disabled_by_default: false
+
+
+
+  - platform: template
+    name: ${emerson_r48}_outPower
+    id: ${emerson_r48}_outpower
+    device_id: Emerson
+    unit_of_measurement: W
+    device_class: power
+    update_interval: 6s 
+    accuracy_decimals: 2
+    lambda: |-
+      if(id(${emerson_r48}_DC_Current).state>0) { return ( id(${emerson_r48}_DC_Current).state * id(${emerson_r48}_DC_Voltage).state ); } 
+      else {return 0;}    
+
+
+  - platform: template
+    name: "Consommation Maison"
+    id: consommation_maison
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    device_id: powermeter
+    lambda: return id(latest_power);
+    update_interval: never
+
+  - platform: template
+    name: "Puissance Panneau"
+    id: puissance_panneau
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    device_id: powermeter
+    lambda: return id(latest_panel);
+    update_interval: never    
+
+  - platform: template
+    name: "Routage Cumulus"
+    id: routage_cumulus
+    unit_of_measurement: "%"
+    device_class: power_factor
+    state_class: measurement
+    accuracy_decimals: 1
+    device_id: powermeter 
+    lambda: return id(latest_routage);
+    update_interval: never   
+
+  - platform: minipid
+    minipid_id: ${minipid_id}
+    error: 
+      name: ${minipid_name}_error
+      unit_of_measurement: 'W'
+      accuracy_decimals: 1
+      device_id: Soyosource
+    output: 
+      name: ${minipid_name}_output
+      unit_of_measurement: '%'
+      accuracy_decimals: 1
+      device_id: Soyosource
+    target:
+      name: ${minipid_name}_target
+      unit_of_measurement: 'W'
+      accuracy_decimals: 1
+      device_id: Soyosource
+
+  - platform: minipid
+    minipid_id: ${minipid_id2}
+    error: 
+      name: ${minipid_name2}_error
+      unit_of_measurement: 'W'
+      accuracy_decimals: 1
+      device_id: Emerson
+    output: 
+      name: ${minipid_name2}_output
+      unit_of_measurement: '%'
+      accuracy_decimals: 1
+      device_id: Emerson
+    target:
+      name: ${minipid_name2}_target
+      unit_of_measurement: 'W'
+      accuracy_decimals: 1
+      device_id: Emerson     
+
+  - platform: template
+    name: ${minipid_name2}_input_smoothed
+    id: ${minipid_name2}_input_smoothed
+    device_id: Emerson
+    device_class: power
+    icon: mdi:power
+    unit_of_measurement: 'W'
+    accuracy_decimals: 1
+    update_interval: never
+#    update_interval: 1s
+#    lambda: |-
+#      float conso = id(consommation_maison).state;
+#      float routage = id(routage_cumulus).state;
+#      
+#      
+#      // Vérifier que les valeurs sont valides
+#      if (isnan(conso) || isnan(routage)) {
+#        return {};  // Retourner une valeur invalide si pas encore de données
+#      }
+#      
+#      // Si consommation proche de zéro ET routage faible
+#      if (conso < 20.0 && conso > -20.0 && routage < 290.0) {
+#        return (100 - routage * 6.87 );
+#      } else {
+#        return conso;
+#      }
+    filters:
+      - sliding_window_moving_average:
+          window_size: 1
+          send_every: 1  
+           
+  - platform: template
+    name: ${minipid_name}_input_smoothed
+    id: ${minipid_name}_input_smoothed
+    device_id: Soyosource
+    device_class: power
+    icon: mdi:power
+    unit_of_measurement: 'W'
+    accuracy_decimals: 1
+    update_interval: never
+#    update_interval: 1s
+#    lambda: |-
+#      float conso = id(consommation_maison).state;
+#      float routage = id(routage_cumulus).state;
+#      
+#      
+#      // Vérifier que les valeurs sont valides
+#      if (isnan(conso) || isnan(routage)) {
+#        return {0};  // Retourner une valeur invalide si pas encore de données
+#      }
+#      
+#      // Si consommation proche de zéro ET routage faible
+#      
+#        return (conso - routage * 6.87 );
+      
+    filters:
+      - sliding_window_moving_average:
+          window_size: 1
+          send_every: 1  
+          
+  - platform: debug
+    free:
+      name: "Heap Free"
+
+    block:
+      name: "Heap Max Block"
+    loop_time:
+      name: "Loop Time"
+    psram:
+      name: "Free PSRAM"
+    cpu_frequency:
+      name: "CPU Frequency"
+
+  # Statistiques HTTP
+  - platform: template
+    name: "HTTP Requêtes réussies"
+    id: http_success_sensor
+    icon: mdi:check-network
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(http_success_count);
+
+  - platform: template
+    name: "HTTP Erreurs"
+    id: http_error_sensor
+    icon: mdi:alert-network
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(http_error_count);
+
+  - platform: template
+    name: "HTTP Taux de succès"
+    id: http_success_rate
+    icon: mdi:percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      int total = id(http_success_count) + id(http_error_count);
+      if (total == 0) return 0.0;
+      return (float)id(http_success_count) / total * 100.0;
+
+  # Sensor pour afficher le délai actuel en secondes (plus lisible)
+  - platform: template
+    name: "Fréquence actualisation"
+    id: http_polling_frequency
+    icon: mdi:sync
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      float interval_ms = id(http_polling_interval).state;
+      if (interval_ms > 0) {
+        return 1000.0 / interval_ms;  // Convertir ms en Hz
+      }
+      return 0.0;      
+
+
+switch:
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    charging:
+      name: "${bms0} charging"
+      device_id: JKBMS_55Ah
+    discharging:
+      name: "${bms0} discharging"
+      device_id: JKBMS_55Ah
+    balancer:
+      name: "${bms0} balancer"
+      device_id: JKBMS_55Ah
+
+
+  - platform: ble_client
+    ble_client_id: client0
+    id: ble_client_switch0
+    name: "${bms0} enable bluetooth connection"
+    device_id: JKBMS_55Ah
+
+  - platform: ble_client
+    ble_client_id: client1
+    name: "${bms1} enable bluetooth connection"
+    device_id: JBD_BMS
+
+  - platform: jbd_bms_ble
+    jbd_bms_ble_id: bms1
+    charging:
+      name: "${bms1} charging"
+      device_id: JBD_BMS
+    discharging:
+      name: "${bms1} discharging"
+      device_id: JBD_BMS
+
+  - platform: gpio
+    pin:
+      number: ${switch1_pin}
+      inverted: false
+    name: Charge  
+
+  - platform: soyosource_virtual_meter
+    soyosource_virtual_meter_id: virtualmeter0
+    manual_mode:
+      name: "${GTN} manual mode"
+      restore_mode: RESTORE_DEFAULT_ON
+      device_id: Soyosource
+    emergency_power_off:
+      name: "${GTN} emergency power off"
+      restore_mode: RESTORE_DEFAULT_ON
+      device_id: Soyosource
+
+    
+  - platform: emerson_r48
+    ac_sw:
+      name: "${emerson_r48}_AC switch Turn OFF"
+      restore_mode: ALWAYS_ON
+      id:  ${emerson_r48}_ac_sw
+      device_id: Emerson
+    dc_sw:
+      name: "${emerson_r48}_DC switch Turn OFF"
+      restore_mode: ALWAYS_ON
+      id:  ${emerson_r48}_dc_sw
+      device_id: Emerson
+    fan_sw:
+      name: "${emerson_r48}_FAN switch MAX"
+      device_id: Emerson
+    led_sw:
+      name: "${emerson_r48}_LED switch"
+      device_id: Emerson
+
+  - platform: minipid
+    minipid_id: ${minipid_id}
+    activation: 
+      name: ${minipid_name}_activation
+      id: ${minipid_name}_activation
+      device_id: Soyosource
+    manual_override: 
+      name: ${minipid_name}_manual_override
+      id: ${minipid_name}_manual_override
+      device_id: Soyosource
+    pid_mode: 
+      name: ${minipid_name}_pid_mode
+      id: ${minipid_name}_pid_mode
+      device_id: Soyosource
+    reverse: 
+      name: ${minipid_name}_reverse
+      id: ${minipid_name}_reverse
+      device_id: Soyosource
+
+  - platform: minipid
+    minipid_id: ${minipid_id2}
+    activation: 
+      name: ${minipid_name2}_activation
+      id: ${minipid_name2}_activation
+      device_id: Emerson
+      on_state:
+        then:
+          - if:
+              condition:
+                switch.is_on: ${minipid_name2}_activation
+              then:
+                - number.set:
+                    id: ${minipid_name2}_output_max      
+                    value: !lambda 'return id(battery_actual_max_current).state/15.8*30;'
+
+    manual_override: 
+      name: ${minipid_name2}_manual_override
+      id: ${minipid_name2}_manual_override
+      device_id: Emerson
+    pid_mode: 
+      name: ${minipid_name2}_pid_mode
+      id: ${minipid_name2}_pid_mode
+      device_id: Emerson
+    reverse: 
+      name: ${minipid_name2}_reverse
+      id: ${minipid_name2}_reverse
+      device_id: Emerson     
+
+  - platform: template
+    name: "Activer collecte status.xml"
+    id: enable_http_polling
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:download-network
+    turn_on_action:
+      - lambda: |-
+          id(http_task_enabled) = true;
+          ESP_LOGI("switch", "Collecte HTTP activée");
+    turn_off_action:
+      - lambda: |-
+          id(http_task_enabled) = false;
+          ESP_LOGI("switch", "Collecte HTTP désactivée");      
+
+text_sensor:
+  - platform: jk_bms_ble
+    jk_bms_ble_id: bms0
+    errors:
+      name: "${bms0} errors"
+      device_id: JKBMS_55Ah
+    total_runtime_formatted:
+      name: "${bms0} total runtime formatted"
+      device_id: JKBMS_55Ah
+
+  - platform: jbd_bms_ble
+    jbd_bms_ble_id: bms1
+    errors:
+      name: "${bms1} errors"
+      device_id: JBD_BMS
+    operation_status:
+      name: "${bms1} operation status"
+      device_id: JBD_BMS
+    device_model:
+      name: "${bms1} device model"
+      device_id: JBD_BMS
+
+  - platform: wifi_info
+    ip_address:
+      name: ESP IP Address
+      address_0:
+        name: ESP IP Address 0
+      address_1:
+        name: ESP IP Address 1
+      address_2:
+        name: ESP IP Address 2
+      address_3:
+        name: ESP IP Address 3
+      address_4:
+        name: ESP IP Address 4
+    ssid:
+      name: ESP Connected SSID
+    bssid:
+      name: ESP Connected BSSID
+    mac_address:
+      name: ESP Mac Wifi Address
+    scan_results:
+      name: ESP Latest Scan Results
+    dns_address:
+      name: ESP DNS Address          
+
+#  - platform: soyosource_inverter
+#    soyosource_inverter_id: inverter0
+#    operation_status:
+#      name: "${GTN} operation status"
+
+  - platform: soyosource_virtual_meter
+    soyosource_virtual_meter_id: virtualmeter0
+    operation_mode:
+      name: "${GTN} limiter operation mode"
+      device_id: Soyosource      
+
+  - platform: debug
+    device:
+      name: "Device Info"
+    reset_reason:
+      name: "Reset Reason"
+
+# I/O
+light:
+  - platform: esp32_rmt_led_strip
+    id: sleep_on_light 
+    rgb_order: GRB
+    pin: GPIO48
+    num_leds: 1
+  
+    chipset: ws2812
+    name: "Sleep On Light"
+    effects:
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 0.05s
+          update_interval: 0.05s
+          min_brightness: 0%
+          max_brightness: 10%
+
+script:
+  - id: check_for_sleep_prevention
+    mode: queued
+    then:
+      - if:
+          condition:
+            binary_sensor.is_off: esp_batterie_sleep_mode
+          then:
+            - light.turn_on:
+                id: sleep_on_light
+                red: 000%
+                blue: 100%
+                green: 0%
+                effect: "Fast Pulse"
+
+          
+            - deep_sleep.prevent: deep_sleep_control
+            - logger.log: 'Sleep Mode OFF'
+            
+
+          else:
+            - light.turn_off:
+                id: sleep_on_light
+
+            - delay: 5s                
+            - deep_sleep.allow: deep_sleep_control
+            - logger.log: "Sleep Mode ON"
+            
+      - delay: 5s
+      - script.execute: check_for_sleep_prevention     
+
+
+deep_sleep:
+  id: deep_sleep_control
+  run_duration: 30s
+  sleep_duration: 1800s        
