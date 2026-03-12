@@ -51,7 +51,7 @@ esphome:
               
               // Configuration du client HTTP avec keep-alive
               esp_http_client_config_t config = {};
-              config.url = "http://192.168.1.xxx/status.xml";
+              config.url = "http://192.168.1.38/status.xml";
               config.timeout_ms = 2000;
               config.keep_alive_enable = true;
               config.keep_alive_idle = 5;
@@ -116,54 +116,58 @@ esphome:
                                 float power_charger;
                                 float power_GTN;
                                 int t = 0;
-
                                 // Mettre à jour seulement si changement > 0.5W
                                 if (fabs(power - last_power) > 0.5) {
                                   id(latest_power) = power;
                                   last_power = power;
-                                  id(consommation_maison).publish_state(power);
                                   
+                                  // Calculer power_charger
                                   if (power < 20.0 && power > -20.0 && routage < 290.0) {
-                                    // Ne rien faire dans ce cas
+                                    id(latest_power_charger) = (100 - routage * 6.87);
                                   } 
                                   else {
-                                    power_charger = power;
-                                    id(minipid_Emerson_input_smoothed).publish_state(power_charger);
+                                    id(latest_power_charger) = power;
                                   }
-
-                                  power_GTN = power - routage * 6.87;
-                                  id(minipid_GTN_input_smoothed).publish_state(power_GTN);
+                                  
+                                  // Calculer power_GTN
+                                  id(latest_power_GTN) = power - routage * 6.87;
+                                  
                                   t = 1;
                                 }
-                                
+
                                 if (fabs(panel - last_panel) > 0.5) {
                                   id(latest_panel) = panel;
                                   last_panel = panel;
-                                  id(puissance_panneau).publish_state(panel);
                                 }
 
                                 if (fabs(routage - last_routage) > 0.5) {
                                   id(latest_routage) = routage;
                                   last_routage = routage;
-                                  id(routage_cumulus).publish_state(routage);
-
+                                  
+                                  // Recalculer power_charger si routage change
                                   if (power < 20.0 && power > -20.0 && routage < 290.0) {
-                                    power_charger = (100 - routage * 6.87);
-                                    id(minipid_Emerson_input_smoothed).publish_state(power_charger);
-                                  } 
-
+                                    id(latest_power_charger) = (100 - routage * 6.87);
+                                  }
+                                  
+                                  // Recalculer power_GTN si routage change
                                   if (t == 0) {
-                                    power_GTN = power - routage * 6.87;
-                                    id(minipid_GTN_input_smoothed).publish_state(power_GTN);
+                                    id(latest_power_GTN) = power - routage * 6.87;
                                   }
                                 }
+
+                                // Incrémenter le compteur de succès
+                                id(http_success_count)++;
+
+                                ESP_LOGD("http_task", "Power: %.1f W, Panel: %.1f W, Routage: %.1f W (en %d ms, délai: %d ms)", 
+                                        power, panel, routage, millis() - start, delay_ms);
+
                                 
                                 // Incrémenter le compteur de succès
                                 id(http_success_count)++;
                                 
                                 ESP_LOGD("http_task", "Power: %.1f W, Panel: %.1f W, Routage: %.1f W (en %d ms, délai: %d ms)", 
                                         power, panel, routage, millis() - start, delay_ms);
-                              }
+                                                                      }
                             }
                           }
                         }
@@ -282,7 +286,15 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'    
-  
+  - id: latest_power_charger
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: latest_power_GTN
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
     
 
 
@@ -334,7 +346,7 @@ substitutions:
 # Enable Home Assistant API
 api:
   encryption:
-    key: "ec1rTq/jz3godkuEawMHyMm+mywiY0IO4pNfrVFSRTQ="
+    key: "xxxx"
   reboot_timeout: 0s  
 
   #services:
@@ -348,7 +360,7 @@ api:
 
 ota:
   - platform: esphome
-    password: XXXXXXX
+    password: "xxxx"
     on_begin:
       then:
         - switch.turn_off: ble_client_switch0
@@ -371,7 +383,7 @@ wifi:
 # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: "Esp-Batterie Fallback Hotspot"
-    password: XXXXXXXXX
+    password: "xxxx"
 
 captive_portal:
 
@@ -1435,38 +1447,39 @@ sensor:
       else {return 0;}    
 
 
+
   - platform: template
     name: "Consommation Maison"
     id: consommation_maison
     unit_of_measurement: "W"
     device_class: power
+    device_id: powermeter
     state_class: measurement
     accuracy_decimals: 1
-    device_id: powermeter
-    lambda: return id(latest_power);
-    update_interval: never
+    update_interval: 250ms  # Lire toutes les 500ms
+    lambda: return id(latest_power);   
 
   - platform: template
     name: "Puissance Panneau"
     id: puissance_panneau
     unit_of_measurement: "W"
     device_class: power
+    device_id: powermeter
     state_class: measurement
     accuracy_decimals: 1
-    device_id: powermeter
+    update_interval: 250ms
     lambda: return id(latest_panel);
-    update_interval: never    
 
   - platform: template
     name: "Routage Cumulus"
     id: routage_cumulus
     unit_of_measurement: "%"
-    device_class: power_factor
+    device_class: power
+    device_id: powermeter
     state_class: measurement
     accuracy_decimals: 1
-    device_id: powermeter 
+    update_interval: 250ms
     lambda: return id(latest_routage);
-    update_interval: never   
 
   - platform: minipid
     minipid_id: ${minipid_id}
@@ -1504,66 +1517,37 @@ sensor:
       accuracy_decimals: 1
       device_id: Emerson     
 
+  
   - platform: template
     name: ${minipid_name2}_input_smoothed
     id: ${minipid_name2}_input_smoothed
-    device_id: Emerson
     device_class: power
     icon: mdi:power
     unit_of_measurement: 'W'
     accuracy_decimals: 1
-    update_interval: never
-#    update_interval: 1s
-#    lambda: |-
-#      float conso = id(consommation_maison).state;
-#      float routage = id(routage_cumulus).state;
-#      
-#      
-#      // Vérifier que les valeurs sont valides
-#      if (isnan(conso) || isnan(routage)) {
-#        return {};  // Retourner une valeur invalide si pas encore de données
-#      }
-#      
-#      // Si consommation proche de zéro ET routage faible
-#      if (conso < 20.0 && conso > -20.0 && routage < 290.0) {
-#        return (100 - routage * 6.87 );
-#      } else {
-#        return conso;
-#      }
+    device_id: Emerson
+    update_interval: 500ms  # ← Ajoutez ceci
+    lambda: return id(latest_power_charger);
     filters:
       - sliding_window_moving_average:
           window_size: 1
-          send_every: 1  
+          send_every: 1
            
   - platform: template
-    name: ${minipid_name}_input_smoothed
+    name: ${minipid_name}_input_smoothed  # GTN
     id: ${minipid_name}_input_smoothed
-    device_id: Soyosource
     device_class: power
     icon: mdi:power
     unit_of_measurement: 'W'
+    device_id: Soyosource
     accuracy_decimals: 1
-    update_interval: never
-#    update_interval: 1s
-#    lambda: |-
-#      float conso = id(consommation_maison).state;
-#      float routage = id(routage_cumulus).state;
-#      
-#      
-#      // Vérifier que les valeurs sont valides
-#      if (isnan(conso) || isnan(routage)) {
-#        return {0};  // Retourner une valeur invalide si pas encore de données
-#      }
-#      
-#      // Si consommation proche de zéro ET routage faible
-#      
-#        return (conso - routage * 6.87 );
-      
+    update_interval: 500ms  # ← Ajoutez ceci
+    lambda: return id(latest_power_GTN);
     filters:
       - sliding_window_moving_average:
           window_size: 1
-          send_every: 1  
-          
+          send_every: 1
+
   - platform: debug
     free:
       name: "Heap Free"
